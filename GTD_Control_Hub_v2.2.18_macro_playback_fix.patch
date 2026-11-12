@@ -1,0 +1,32 @@
+diff --git a/GTD_Control_Hub_Delta_v2.2.18.lua b/GTD_Control_Hub_Delta_v2.2.18.lua
+--- a/GTD_Control_Hub_Delta_v2.2.18.lua
++++ b/GTD_Control_Hub_Delta_v2.2.18.lua
+@@ -2090,6 +2090,7 @@ Macro.startTowerLevelWatcher = startTowerLevelWatcher
+ Macro.PlaceRemote = PlaceRemote
+ Macro.findRemoteFunction = findRemoteFunction
+ Macro.snapshotTowerIds = snapshotTowerIds
++Macro.findLiveTowerModelById = findLiveTowerModelById
+ Macro.waitForNewTowerId = waitForNewTowerId
+ Macro.attachEntityArrivalWatcher = attachEntityArrivalWatcher
+ Macro.actionWorldPositionForContext = actionWorldPositionForContext
+@@ -2217,7 +2218,11 @@ local function invokePlacementWithTimeout(action, payload, timeoutSeconds, taskId)
+ 
+     Macro.attachEntityArrivalWatcher(State.ActiveContext)
+-    local beforeIds = snapshotTowerIds(State.ActiveContext)
++    local snapshotFn = Macro.snapshotTowerIds
++    if type(snapshotFn) ~= "function" then
++        return false, "Macro snapshot helper is unavailable"
++    end
++    local beforeIds = snapshotFn(State.ActiveContext)
+     local response = nil
+     task.spawn(function()
+         local ok, result = pcall(function()
+@@ -2483,7 +2488,7 @@ local function playMacro()
+                             if not towerId then
+                                 actionError = "no live tower ID bound for " .. tostring(action.towerKey or "unknown tower")
+                             else
+-                                local liveModel = findLiveTowerModelById(towerId, State.ActiveContext)
++                                local liveModel = Macro.findLiveTowerModelById and Macro.findLiveTowerModelById(towerId, State.ActiveContext)
+                                 if not liveModel then
+                                     actionError = "mapped live ID " .. tostring(towerId) .. " is not present in active Entities"
+                                 elseif expectedUnit and liveModel.Name ~= expectedUnit then
