@@ -1,584 +1,451 @@
 --[[
-    GTD CONTROL HUB • DELTA v2.2.37 PATCH LOADER
+    GTD CONTROL HUB • DELTA v2.2.37
 
-    Builds on v2.2.30 with a match-cycle detector fix, restores REFRESH,
-    and keeps the persistent controls on the Macro Recorder card:
-      • RE-RECORD: load the selected saved macro, then arm recording to the
-        same filename. The old file remains until STOP & SAVE.
-      • DELETE: two-click confirmation, removes the selected JSON and its
-        entry from index.json.
-      • CANCEL: the RE-RECORD button becomes CANCEL while overwrite is armed.
+    Playback reliability update, based on the existing v2.2.30 source:
+      • Stable per-match session generation, including Context reuse.
+      • Short grace for transient RoundLive=false flickers during playback.
+      • Late PlaceUnit response verification through Entity ChildAdded events;
+        no duplicate placement is sent after an ambiguous timeout.
+      • Longer event-ID/model replication window before dependent actions run.
+      • The loop preference is retained in the executor environment.
+      • Macro list refresh, same-name RE-RECORD, CANCEL and DELETE remain
+        integrated in the main Macro Recorder card.
 
-    Unlike v2.2.33, the controls are visible on the main Macro Recorder card;
-    they do not depend on opening the dropdown to discover them.
+    This is a source-transforming loader. Upload this complete file to the
+    repository as GTD_Control_Hub_Delta_v2.2.37.lua, then run its raw URL.
 ]]
 
 local BASE_URL = "https://raw.githubusercontent.com/litvinovasez-eng/gtd-control-hub/main/GTD_Control_Hub_Delta_v2.2.30.lua"
 local ENV = (type(getgenv) == "function" and getgenv()) or _G
 
-local fetched, source = pcall(function()
+local downloaded, source = pcall(function()
     return game:HttpGet(BASE_URL)
 end)
-if not fetched or type(source) ~= "string" or source == "" then
-    error("GTD Control Hub v2.2.37: failed to download base v2.2.30: " .. tostring(source))
+if not downloaded or type(source) ~= "string" or source == "" then
+    error("GTD Control Hub v2.2.37: could not download the base source: " .. tostring(source))
 end
 
--- v2.2.30's playback worker waits for State.CurrentRoundKey to change.
--- Polling liveRound every 0.10s can miss a short GameEnd overlay. Instead,
--- track the GameEnd GuiObject lifecycle through Roblox signals and increment
--- a match-cycle token when the end screen closes / is removed. runAutomation
--- adds this token to CurrentRoundKey, so the existing playback worker naturally
--- starts the same macro again on the next match without changing action timing.
-local oldLoopHead = [==[
-local function runAutomation()
-    while Gui.Parent do
-        task.wait(0.10)
-        local context = getActiveContext()
-        local roundKey = getRoundKey(context)
-        local liveRound = isInLiveRound(context)
-        State.ActiveContext = context
-]==]
-local newLoopHead = [==[
-local function runAutomation()
-    local endNodes = {}
-    local visibleEndCount = 0
-    local hasSeenEndOverlay = false
-    State.MatchCycle = 0
+local function plainReplace(text, oldText, newText, label, expectedCount)
+    local result = {}
+    local position = 1
+    local count = 0
+    while true do
+        local first, last = string.find(text, oldText, position, true)
+        if not first then break end
+        result[#result + 1] = string.sub(text, position, first - 1)
+        result[#result + 1] = newText
+        position = last + 1
+        count = count + 1
+    end
+    result[#result + 1] = string.sub(text, position)
+    if expectedCount ~= nil and count ~= expectedCount then
+        error("GTD Control Hub v2.2.37 patch mismatch [" .. tostring(label)
+            .. "]: expected " .. tostring(expectedCount) .. ", found " .. tostring(count))
+    end
+    return table.concat(result), count
+end
 
-    local function bumpMatchCycle(reason)
-        State.MatchCycle = (tonumber(State.MatchCycle) or 0) + 1
-        print("[GTD Macro Loop] End-of-match transition #" .. tostring(State.MatchCycle)
-            .. " • " .. tostring(reason))
+local function replaceBetween(text, startMarker, endMarker, newText, label)
+    local first = string.find(text, startMarker, 1, true)
+    if not first then error("GTD Control Hub v2.2.37 missing start anchor: " .. label) end
+    local finish = string.find(text, endMarker, first, true)
+    if not finish then error("GTD Control Hub v2.2.37 missing end anchor: " .. label) end
+    return string.sub(text, 1, first - 1) .. newText .. "\n" .. string.sub(text, finish)
+end
+
+-- Version and GUI identity.
+source = plainReplace(source, "v2.2.30", "v2.2.37", "version labels")
+source = plainReplace(source, "GTDControlHub_Delta_v2230", "GTDControlHub_Delta_v2236", "GUI identity")
+
+-- Persist the loop toggle between script re-executions where the executor environment survives.
+source = plainReplace(source, "    Loop = true,", "    Loop = ENV.__GTDCH_MACRO_LOOP ~= false,", "loop default", 1)
+source = plainReplace(source,
+[[connect(LoopSwitch.Activated, function()
+    State.Loop = not State.Loop
+    tween(LoopSwitch, 0.17, {BackgroundColor3 = State.Loop and Theme.green or Theme.panel3})]],
+[[connect(LoopSwitch.Activated, function()
+    State.Loop = not State.Loop
+    ENV.__GTDCH_MACRO_LOOP = State.Loop
+    tween(LoopSwitch, 0.17, {BackgroundColor3 = State.Loop and Theme.green or Theme.panel3})]],
+    "persist loop switch", 1)
+
+-- Replace timeline waiting so a short RoundLive=false transition does not discard the queue.
+source = replaceBetween(source, "local function waitForPlaybackTime(", "\nlocal function invokePlacementWithTimeout", [[Macro.WaitForPlaybackRound = function(expectedRoundKey, taskId, graceSeconds)
+    local deadline = os.clock() + (tonumber(graceSeconds) or 4.5)
+    repeat
+        if not State.Playing or State.PlaybackTaskId ~= taskId then return false end
+        if expectedRoundKey and State.CurrentRoundKey ~= expectedRoundKey then return false end
+        if State.RoundLive then return true end
+        task.wait(0.10)
+    until os.clock() >= deadline
+    return State.Playing and State.PlaybackTaskId == taskId
+        and (not expectedRoundKey or State.CurrentRoundKey == expectedRoundKey)
+        and State.RoundLive
+end
+
+local function waitForPlaybackTime(action, fallbackDelay, timelineClock, firstActionElapsed, taskId, expectedRoundKey)
+    local actionElapsed = tonumber(action.elapsed)
+    local function sessionValid()
+        return State.Playing and State.PlaybackTaskId == taskId
+            and (not expectedRoundKey or State.CurrentRoundKey == expectedRoundKey)
     end
 
-    local function setEndNodeVisible(node, visible)
-        local previous = endNodes[node]
-        if previous == visible then return end
-        endNodes[node] = visible
-
-        if visible then
-            visibleEndCount = visibleEndCount + 1
-            hasSeenEndOverlay = true
-        else
-            visibleEndCount = math.max(0, visibleEndCount - 1)
-            if visibleEndCount == 0 and hasSeenEndOverlay then
-                hasSeenEndOverlay = false
-                bumpMatchCycle("GameEnd hidden")
+    -- Keep recorded action gaps while tolerating brief false updates during UI/context swaps.
+    if timelineClock and firstActionElapsed ~= nil and actionElapsed ~= nil then
+        local offset = math.max(0, actionElapsed - firstActionElapsed)
+        local targetClock = timelineClock + offset
+        local lastLiveAt = os.clock()
+        while sessionValid() do
+            if State.RoundLive then
+                lastLiveAt = os.clock()
+                local remaining = targetClock - os.clock()
+                if remaining <= 0 then return true end
+                task.wait(math.min(remaining, 0.20))
+            else
+                if os.clock() - lastLiveAt > 4.5 then return false end
+                task.wait(0.10)
             end
         end
+        return false
     end
 
-    local function watchGameEndNode(object)
-        if not object or object.Name ~= "GameEnd" or not object:IsA("GuiObject") then return end
-        if endNodes[object] ~= nil then return end
-        endNodes[object] = false
-        connect(object:GetPropertyChangedSignal("Visible"), function()
-            setEndNodeVisible(object, object.Visible)
-        end)
-        setEndNodeVisible(object, object.Visible)
-    end
-
-    local function removeGameEndNode(object)
-        if endNodes[object] ~= nil then
-            -- DescendantRemoving may happen without a Visible=false event.
-            setEndNodeVisible(object, false)
-            endNodes[object] = nil
+    local remaining = math.max(0, tonumber(fallbackDelay) or 0)
+    local lastLiveAt = os.clock()
+    while remaining > 0 and sessionValid() do
+        if State.RoundLive then
+            lastLiveAt = os.clock()
+            local slice = math.min(remaining, 0.20)
+            task.wait(slice)
+            remaining = remaining - slice
+        else
+            if os.clock() - lastLiveAt > 4.5 then return false end
+            task.wait(0.10)
         end
     end
+    return sessionValid() and State.RoundLive
+end]], "round-tolerant playback timeline")
 
-    -- Attach to the two known GTD GUI roots, then catch recreated end screens.
-    for _, rootName in ipairs({"GameGui", "GameGuiNoInset"}) do
-        local root = PlayerGui:FindFirstChild(rootName)
-        local screen = root and root:FindFirstChild("Screen")
-        local middle = screen and screen:FindFirstChild("Middle")
-        local endGui = middle and middle:FindFirstChild("GameEnd")
-        if endGui then watchGameEndNode(endGui) end
-    end
-    connect(PlayerGui.DescendantAdded, watchGameEndNode)
-    connect(PlayerGui.DescendantRemoving, removeGameEndNode)
+-- Keep the pre-call ID snapshot when a PlaceUnit InvokeServer times out.
+source = plainReplace(source,
+[[if not response then
+        return false, "PlaceUnit timed out; stopped to avoid sending duplicate requests"
+    end]],
+[[if not response then
+        return false, "PlaceUnit timed out; checking for a late server placement before stopping", beforeIds
+    end]], "preserve snapshot on timeout", 1)
 
-    while Gui.Parent do
-        task.wait(0.10)
-        local context = getActiveContext()
-        local baseRoundKey = getRoundKey(context)
-        local roundKey = tostring(baseRoundKey) .. ":endCycle=" .. tostring(State.MatchCycle or 0)
-        local liveRound = isInLiveRound(context)
-        State.ActiveContext = context
-]==]
+-- Placement retry should tolerate short live-state flickers without sending duplicate calls.
+source = plainReplace(source,
+[[local function invokePlacementWithRetry(action, payload, taskId)
+    -- Explicit server rejection is safe to retry: no placement was accepted.
+    -- A timeout or thrown remote error is NOT retried because the server may have
+    -- processed the request even though the client did not receive the response.
+    local deadline = os.clock() + 18
+    local attempts = 0
+    local lastError = "server rejected placement"
+    repeat
+        if not State.Playing or State.PlaybackTaskId ~= taskId or not State.RoundLive then
+            return false, "playback stopped"
+        end]],
+[[local function invokePlacementWithRetry(action, payload, taskId, expectedRoundKey)
+    -- Explicit rejection is safe to retry. Ambiguous timeout/error responses are never
+    -- resent until the event cache confirms whether the first request actually placed a tower.
+    local deadline = os.clock() + 18
+    local attempts = 0
+    local lastError = "server rejected placement"
+    repeat
+        if not Macro.WaitForPlaybackRound(expectedRoundKey, taskId, 4.5) then
+            return false, "playback round changed or stopped before placement retry"
+        end]], "placement retry round grace", 1)
 
-local function replaceExactlyOnce(haystack, needle, replacement, label)
-    local first, last = string.find(haystack, needle, 1, true)
-    if not first then
-        error("GTD Control Hub v2.2.37: source patch target not found: " .. label)
+-- On ambiguous timeout/error, look for the placed entity before declaring failure.
+source = plainReplace(source,
+[[        lastError = tostring(placeError or "unknown placement failure")
+        if not lastError:find("server returned false", 1, true) then
+            return false, lastError
+        end]],
+[[        lastError = tostring(placeError or "unknown placement failure")
+        if lastError:find("timed out", 1, true) or lastError:find("PlaceUnit error:", 1, true) then
+            -- The server may have accepted PlaceUnit even if InvokeServer timed out locally.
+            -- Confirm via ChildAdded events before deciding that the action failed.
+            local lateId = Macro.waitForNewTowerId(action, beforeIds or {}, 18, taskId, nil, State.ActiveContext)
+            if lateId then return true, nil, beforeIds, lateId end
+            return false, lastError .. " • no matching late tower event was observed"
+        end
+        if not lastError:find("server returned false", 1, true) then
+            return false, lastError
+        end]], "late placement confirmation", 1)
+
+-- Give every match a generation, even when GTD reuses the same Context/Entities and start time.
+source = replaceBetween(source, "local function getRoundKey(context)", "\nlocal function isInLiveRound", [[-- Generate a session key when a fresh match starts even if GTD reuses Context/Entities.
+State.RoundSessionGeneration = tonumber(State.RoundSessionGeneration) or 0
+State.RoundSessionContext = nil
+State.RoundSessionEntities = nil
+State.RoundSessionBaseKey = nil
+State.RoundSessionEndedSince = nil
+
+local function getRoundKey(context)
+    local startTime = getGameAttribute("GameStartTime", context)
+    local entities = context and context:FindFirstChild("Entities") or nil
+    local baseKey = context and context:GetFullName() .. ":" .. tostring(startTime or "no-start-time")
+        or "workspace:" .. tostring(startTime or "no-context")
+    local structureChanged = baseKey ~= State.RoundSessionBaseKey
+        or context ~= State.RoundSessionContext
+        or entities ~= State.RoundSessionEntities
+
+    if structureChanged then
+        State.RoundSessionGeneration = State.RoundSessionGeneration + 1
+        State.RoundSessionBaseKey = baseKey
+        State.RoundSessionContext = context
+        State.RoundSessionEntities = entities
+        State.RoundSessionEndedSince = nil
     end
-    local second = string.find(haystack, needle, last + 1, true)
-    if second then
-        error("GTD Control Hub v2.2.37: source patch target is ambiguous: " .. label)
+
+    local started = type(startTime) == "number" and startTime > 0
+    local ended = not started or Macro.isContextEnded(context)
+    if ended then
+        State.RoundSessionEndedSince = State.RoundSessionEndedSince or os.clock()
+    elseif State.RoundSessionEndedSince then
+        -- Ignore one-frame GameEnd/Context flickers; only increment after a stable end-to-live transition.
+        if os.clock() - State.RoundSessionEndedSince >= 0.65 then
+            State.RoundSessionGeneration = State.RoundSessionGeneration + 1
+        end
+        State.RoundSessionEndedSince = nil
     end
-    return string.sub(haystack, 1, first - 1) .. replacement .. string.sub(haystack, last + 1)
+
+    return baseKey .. ":session:" .. tostring(State.RoundSessionGeneration)
+end]], "round session generation")
+
+-- Do not abort the action queue solely because RoundLive was false for one update.
+source = plainReplace(source,
+[[if not State.Playing or State.PlaybackTaskId ~= taskId
+                            or not State.RoundLive or State.CurrentRoundKey ~= roundKey then break end
+
+                        local fallbackDelay = math.max(0, tonumber(action.delay) or 0)
+                        if not waitForPlaybackTime(action, fallbackDelay, timelineClock, firstActionElapsed, taskId) then break end
+                        if not State.RoundLive or State.CurrentRoundKey ~= roundKey then break end]],
+[[if not State.Playing or State.PlaybackTaskId ~= taskId
+                            or State.CurrentRoundKey ~= roundKey then break end
+
+                        local fallbackDelay = math.max(0, tonumber(action.delay) or 0)
+                        if not waitForPlaybackTime(action, fallbackDelay, timelineClock, firstActionElapsed, taskId, roundKey) then break end
+                        if not State.Playing or State.PlaybackTaskId ~= taskId
+                            or State.CurrentRoundKey ~= roundKey then break end]], "action queue live-state grace", 1)
+
+source = plainReplace(source,
+"invokePlacementWithRetry(placementAction, payload, taskId)",
+"invokePlacementWithRetry(placementAction, payload, taskId, roundKey)", "pass expected session to placement", 1)
+source = plainReplace(source,
+"Macro.waitForNewTowerId(placementAction, beforeIds or {}, 9, taskId, nil, State.ActiveContext)",
+"Macro.waitForNewTowerId(placementAction, beforeIds or {}, 18, taskId, nil, State.ActiveContext)", "longer tower ID wait", 1)
+source = plainReplace(source,
+"and now - (event.time or now) <= 15 then",
+"and now - (event.time or now) <= 30 then", "longer arrival event retention", 1)
+
+-- Wait briefly for a replicated entity model instead of prematurely aborting dependent actions.
+source = plainReplace(source,
+[[                                local liveModel = Macro.findLiveTowerModelById and Macro.findLiveTowerModelById(towerId, State.ActiveContext)
+                                if not liveModel then
+                                    actionError = "mapped live ID " .. tostring(towerId) .. " is not present in active Entities"
+                                elseif expectedUnit and liveModel.Name ~= expectedUnit then]],
+[[                                local liveModel = Macro.findLiveTowerModelById and Macro.findLiveTowerModelById(towerId, State.ActiveContext)
+                                if not liveModel then
+                                    local modelWaitDeadline = os.clock() + 4
+                                    repeat
+                                        if not State.Playing or State.PlaybackTaskId ~= taskId
+                                            or State.CurrentRoundKey ~= roundKey then break end
+                                        task.wait(0.10)
+                                        liveModel = Macro.findLiveTowerModelById and Macro.findLiveTowerModelById(towerId, State.ActiveContext)
+                                    until liveModel or os.clock() >= modelWaitDeadline
+                                end
+                                if not liveModel then
+                                    actionError = "mapped live ID " .. tostring(towerId) .. " did not replicate into Entities within 4s"
+                                elseif expectedUnit and liveModel.Name ~= expectedUnit then]], "wait for tower model replication", 1)
+
+-- If a match boundary interrupts an action, keep the loop armed for the next match.
+source = plainReplace(source,
+[[                        if not actionOk then
+                            if State.Playing and State.PlaybackTaskId == taskId then
+                                State.Playing = false
+                                State.PlaybackArmed = false
+                                setStatus("Проигрывание остановлено на действии №" .. tostring(index) .. ": " .. tostring(actionError), Theme.red)
+                            end
+                            break
+                        end]],
+[[                        if not actionOk then
+                            if State.Playing and State.PlaybackTaskId == taskId then
+                                if State.Loop and (not State.RoundLive or State.CurrentRoundKey ~= roundKey) then
+                                    setStatus("Матч сменился на действии №" .. tostring(index)
+                                        .. " • полный макрос повторится в следующем матче", Theme.amber)
+                                else
+                                    State.Playing = false
+                                    State.PlaybackArmed = false
+                                    setStatus("Проигрывание остановлено на действии №" .. tostring(index)
+                                        .. " (" .. tostring(actionType) .. "): " .. tostring(actionError), Theme.red)
+                                end
+                            end
+                            break
+                        end]], "keep loop alive after round boundary", 1)
+
+-- Clear overwrite state after a successful same-name save.
+source = plainReplace(source,
+[[    State.MacroIsDraft = false
+    State.SelectedMacroSlotName = State.MacroName
+    State.RefreshMacroSlotSelector(State.MacroName)]],
+[[    State.MacroIsDraft = false
+    State.MacroOverwriteArmed = false
+    State.MacroOverwriteTargetName = nil
+    State.SelectedMacroSlotName = State.MacroName
+    State.RefreshMacroSlotSelector(State.MacroName)]], "clear re-record state after save", 1)
+
+-- Keep macro-management controls directly in the base script.
+do
+    local macroTools = [=[
+-- Integrated macro controls: refresh, same-name re-record and delete.
+do
+    State.MacroRefreshButton = secondaryButton(MacroActions, "↻ REFRESH",
+        UDim2.new(1,-94,0,31), UDim2.fromOffset(80,27), function() end)
+    State.MacroRefreshButton.TextSize = 9
+    State.MacroPickerButton.Size = UDim2.new(1,-108,0,27)
+    CountLabel.Size = UDim2.new(1,-190,0,16)
+
+    State.MacroReRecordButton = secondaryButton(MacroActions, "RE-RECORD",
+        UDim2.new(1,-184,0,91), UDim2.fromOffset(80,23), function() end)
+    State.MacroDeleteSelectedButton = secondaryButton(MacroActions, "DELETE",
+        UDim2.new(1,-96,0,91), UDim2.fromOffset(80,23), function() end)
+
+    State.UpdateMacroToolButtons = function()
+        local selected = not State.MacroIsDraft and State.SelectedMacroSlotName
+        local valid = type(selected) == "string" and selected ~= "" and State.MacroName == selected
+        local busy = State.Recording or State.RecordingArmed or State.Playing
+        State.MacroReRecordButton.Text = State.MacroOverwriteArmed and "CANCEL" or "RE-RECORD"
+        State.MacroReRecordButton.Active = not busy and (State.MacroOverwriteArmed or valid)
+        State.MacroReRecordButton.AutoButtonColor = State.MacroReRecordButton.Active
+        State.MacroReRecordButton.BackgroundColor3 = State.MacroOverwriteArmed
+            and Theme.red or (valid and Theme.panel3 or Theme.panel)
+        State.MacroDeleteSelectedButton.Active = not busy and valid
+        State.MacroDeleteSelectedButton.AutoButtonColor = State.MacroDeleteSelectedButton.Active
+        State.MacroDeleteSelectedButton.BackgroundColor3 = valid and Theme.red or Theme.panel
+        State.MacroDeleteSelectedButton.Text = selected and State.MacroDeleteConfirmName == selected
+            and "CONFIRM?" or "DELETE"
+    end
+
+    State.RefreshMacroSlotSelectorOriginal = State.RefreshMacroSlotSelector
+    State.RefreshMacroSlotSelector = function(...)
+        local result = State.RefreshMacroSlotSelectorOriginal(...)
+        State.UpdateMacroToolButtons()
+        return result
+    end
+
+    connect(State.MacroRefreshButton.Activated, function()
+        local ok, err = pcall(State.EnsureMacroFolders)
+        if not ok then setStatus("Macro folder refresh failed: " .. tostring(err), Theme.red); return end
+        State.RefreshMacroSlotSelector(State.SelectedMacroSlotName or (not State.MacroIsDraft and State.MacroName or nil))
+        State.MacroDropdownPanel.Visible = true
+        State.RenderMacroDropdown()
+        setStatus("Macro list refreshed • " .. tostring(#State.MacroSlots) .. " saved", Theme.green)
+    end)
+
+    connect(State.MacroReRecordButton.Activated, function()
+        if State.Recording or State.RecordingArmed or State.Playing then
+            setStatus("Stop recording / playback first", Theme.amber); return
+        end
+        if State.MacroOverwriteArmed then
+            local target = State.MacroOverwriteTargetName or State.MacroName
+            State.MacroOverwriteArmed = false
+            State.MacroOverwriteTargetName = nil
+            State.MacroIsDraft = false
+            State.SelectedMacroSlotName = target
+            State.SelectMacroFile(target)
+            State.UpdateMacroToolButtons()
+            setStatus("Re-record cancelled • original macro restored", Theme.green)
+            return
+        end
+        local target = State.SelectedMacroSlotName
+        if type(target) ~= "string" or target == "" or State.MacroIsDraft then
+            setStatus("Select a saved macro first", Theme.amber); return
+        end
+        if not State.SelectMacroFile(target) then
+            setStatus("Could not load selected macro before re-record", Theme.red); return
+        end
+        State.MacroName = target
+        State.MacroIsDraft = true
+        State.MacroOverwriteArmed = true
+        State.MacroOverwriteTargetName = target
+        State.SelectedMacroSlotName = nil
+        State.SelectedMacroSlotIndex = nil
+        State.RefreshMacroSlotSelector(target)
+        setStatus("RE-RECORD READY • " .. target .. " • START RECORDING, then STOP & SAVE", Theme.amber)
+        State.UpdateMacroToolButtons()
+    end)
+
+    connect(State.MacroDeleteSelectedButton.Activated, function()
+        if State.Recording or State.RecordingArmed or State.Playing then
+            setStatus("Stop recording / playback before deleting", Theme.amber); return
+        end
+        local target = State.SelectedMacroSlotName
+        if type(target) ~= "string" or target == "" or State.MacroIsDraft then
+            setStatus("Select a saved macro first", Theme.amber); return
+        end
+        if State.MacroDeleteConfirmName ~= target or not State.MacroDeleteConfirmAt
+            or os.clock() - State.MacroDeleteConfirmAt > 8 then
+            State.MacroDeleteConfirmName = target
+            State.MacroDeleteConfirmAt = os.clock()
+            State.UpdateMacroToolButtons()
+            setStatus("Click CONFIRM? within 8 seconds to delete " .. target, Theme.red)
+            return
+        end
+        local path = macroPath(target)
+        if type(delfile) ~= "function" then setStatus("Delta delfile API unavailable", Theme.red); return end
+        local deleted, deleteError = pcall(delfile, path)
+        if not deleted then setStatus("Delete failed: " .. tostring(deleteError), Theme.red); return end
+        local remaining = {}
+        for _, name in ipairs(State.ReadMacroSlotNames()) do
+            if macroPath(name) ~= path then table.insert(remaining, name) end
+        end
+        local indexOk, indexError = pcall(function()
+            State.EnsureMacroFolders()
+            writefile(State.MacroIndexPath, HttpService:JSONEncode(remaining))
+        end)
+        State.MacroDeleteConfirmName = nil
+        State.MacroDeleteConfirmAt = nil
+        State.MacroSlots = remaining
+        if State.MacroName == target then
+            State.Placements = {}
+            State.MacroIsDraft = false
+            State.MacroOverwriteArmed = false
+            State.MacroOverwriteTargetName = nil
+            State.SelectedMacroSlotName = nil
+            State.SelectedMacroSlotIndex = nil
+            if remaining[1] then
+                State.SelectMacroFile(remaining[1])
+            else
+                State.MacroName = "My GTD Strategy"
+                State.RefreshMacroSlotSelector(nil)
+                updateMacroCount()
+            end
+        else
+            State.RefreshMacroSlotSelector(State.MacroName)
+        end
+        State.RenderMacroDropdown()
+        State.UpdateMacroToolButtons()
+        if indexOk then
+            setStatus("Deleted macro: " .. target, Theme.green)
+        else
+            setStatus("Macro deleted, but index update failed: " .. tostring(indexError), Theme.amber)
+        end
+    end)
+    State.UpdateMacroToolButtons()
+end
+]=]
+    source = plainReplace(source, "-- Minimize, close, drag and page controls.", macroTools .. "\n-- Minimize, close, drag and page controls.", "integrated macro controls", 1)
 end
 
-source = replaceExactlyOnce(source, oldLoopHead, newLoopHead, "runAutomation GameEnd event detector")
-
-local compiler = loadstring or load
-if type(compiler) ~= "function" then
-    error("GTD Control Hub v2.2.37: loadstring is unavailable")
-end
-local compiled, runBase = pcall(compiler, source)
+local compile = loadstring or load
+if type(compile) ~= "function" then error("GTD Control Hub v2.2.37: executor compiler unavailable") end
+local compiled, runBase = pcall(compile, source)
 if not compiled or type(runBase) ~= "function" then
-    error("GTD Control Hub v2.2.37: patched base compile failed: " .. tostring(runBase))
+    error("GTD Control Hub v2.2.37: patched source compile failed: " .. tostring(runBase))
 end
 runBase()
-
--- Wait for the base UI and v2.2.31 refresh control.
-local startedAt = os.clock()
-local HUB, STATE
-repeat
-    task.wait(0.1)
-    HUB = ENV.__GTD_CONTROL_HUB
-    STATE = type(HUB) == "table" and HUB.State or nil
-until (type(STATE) == "table"
-    and STATE.MacroPickerButton and STATE.MacroPickerButton.Parent
-    and STATE.MacroDropdownPanel
-    and STATE.RefreshMacroSlotSelector
-    and STATE.SelectMacroFile)
-    or os.clock() - startedAt >= 12
-
-if type(STATE) ~= "table" or not STATE.MacroPickerButton or not STATE.MacroPickerButton.Parent then
-    error("GTD Control Hub v2.2.37: Macro Recorder controls were not found")
-end
-
-local HttpService = game:GetService("HttpService")
-local card = STATE.MacroPickerButton.Parent
-
-local function setStatus(message, color)
-    if type(HUB.SetStatus) == "function" then
-        HUB.SetStatus(message, color)
-    end
-end
-
--- Preserve v2.2.31's manual macro-list refresh control.
-if STATE.MacroRefreshButton then pcall(function() STATE.MacroRefreshButton:Destroy() end) end
-STATE.MacroPickerButton.Size = UDim2.new(1, -108, 0, 27)
-local refreshButton = Instance.new("TextButton")
-refreshButton.Name = "MacroRefreshButton"
-refreshButton.Position = UDim2.new(1, -94, 0, 31)
-refreshButton.Size = UDim2.fromOffset(80, 27)
-refreshButton.BackgroundColor3 = Color3.fromRGB(43, 27, 69)
-refreshButton.Text = "↻ REFRESH"
-refreshButton.TextColor3 = Color3.fromRGB(72, 255, 166)
-refreshButton.Font = Enum.Font.GothamBold
-refreshButton.TextSize = 9
-refreshButton.BorderSizePixel = 0
-refreshButton.AutoButtonColor = true
-refreshButton.Parent = card
-local refreshCorner = Instance.new("UICorner")
-refreshCorner.CornerRadius = UDim.new(0, 7)
-refreshCorner.Parent = refreshButton
-STATE.MacroRefreshButton = refreshButton
-local refreshConnection = refreshButton.Activated:Connect(function()
-    local ok, err = pcall(function()
-        if type(STATE.EnsureMacroFolders) == "function" then STATE.EnsureMacroFolders() end
-        local preferred = STATE.SelectedMacroSlotName
-        if not preferred and not STATE.MacroIsDraft then preferred = STATE.MacroName end
-        STATE.RefreshMacroSlotSelector(preferred)
-        STATE.MacroDropdownPanel.Visible = true
-        STATE.RenderMacroDropdown()
-        if STATE.MacroIsDraft and STATE.MacroDropdownScroll then
-            local draft = Instance.new("TextLabel")
-            draft.Name = "CurrentMacroDraft"
-            draft.Size = UDim2.new(1, -6, 0, 32)
-            draft.BackgroundColor3 = Color3.fromRGB(43, 27, 69)
-            draft.BackgroundTransparency = 0.08
-            draft.Text = "✎ DRAFT: " .. tostring(STATE.MacroName) .. " • NOT SAVED"
-            draft.TextColor3 = Color3.fromRGB(72, 255, 166)
-            draft.Font = Enum.Font.GothamBold
-            draft.TextSize = 9
-            draft.TextWrapped = true
-            draft.TextXAlignment = Enum.TextXAlignment.Left
-            draft.BorderSizePixel = 0
-            draft.LayoutOrder = 0
-            draft.ZIndex = 82
-            draft.Parent = STATE.MacroDropdownScroll
-        end
-        setStatus("Macro list refreshed • " .. tostring(#(STATE.MacroSlots or {})) .. " saved",
-            Color3.fromRGB(72, 245, 153))
-    end)
-    if not ok then setStatus("Refresh error: " .. tostring(err), Color3.fromRGB(255, 83, 126)) end
-end)
-if type(HUB.Connections) == "table" then table.insert(HUB.Connections, refreshConnection) end
-
-
-local function macroPath(name)
-    local safe = tostring(name or "Macro")
-        :gsub("[^%w%-%_ ]", "_")
-        :gsub("^%s+", "")
-        :gsub("%s+$", "")
-    if safe == "" then safe = "Macro" end
-    return "GTDControlHub/Macros/" .. safe .. ".json"
-end
-
-local function isBusy()
-    return STATE.Recording == true
-        or STATE.RecordingArmed == true
-        or STATE.Playing == true
-end
-
-local function savedFileExists(name)
-    local path = macroPath(name)
-    if type(isfile) == "function" then
-        local ok, result = pcall(isfile, path)
-        if ok then return result == true end
-    end
-    if type(readfile) == "function" then
-        local ok = pcall(readfile, path)
-        return ok
-    end
-    return false
-end
-
-local function getSelectedSavedMacro()
-    if STATE.MacroIsDraft then return nil end
-    local selected = STATE.SelectedMacroSlotName
-    if type(selected) ~= "string" or selected == "" then return nil end
-    if not STATE.MacroName or macroPath(selected) ~= macroPath(STATE.MacroName) then
-        return nil
-    end
-    if not savedFileExists(selected) then return nil end
-    return selected
-end
-
--- Find the existing action counter so the two persistent buttons have room.
-local countLabel
-for _, child in ipairs(card:GetChildren()) do
-    if child:IsA("TextLabel") then
-        local lower = string.lower(child.Text or "")
-        if string.find(lower, "actions", 1, true) or string.find(lower, "macro selected", 1, true) then
-            countLabel = child
-            break
-        end
-    end
-end
-if countLabel then
-    countLabel.Position = UDim2.fromOffset(14, 94)
-    countLabel.Size = UDim2.new(1, -190, 0, 16)
-    countLabel.TextTruncate = Enum.TextTruncate.AtEnd
-end
-
--- Remove controls from a previous execution of this same patch without touching
--- the base selector or REFRESH button.
-for _, name in ipairs({"MacroReRecordButton", "MacroDeleteSelectedButton"}) do
-    local old = card:FindFirstChild(name)
-    if old then pcall(function() old:Destroy() end) end
-end
-
-local function makeActionButton(name, position, textValue, bg, fg)
-    local button = Instance.new("TextButton")
-    button.Name = name
-    button.Position = position
-    button.Size = UDim2.fromOffset(80, 23)
-    button.BackgroundColor3 = bg
-    button.Text = textValue
-    button.TextColor3 = fg
-    button.Font = Enum.Font.GothamBold
-    button.TextSize = 8
-    button.BorderSizePixel = 0
-    button.AutoButtonColor = true
-    button.Active = true
-    button.Visible = true
-    button.ZIndex = 5
-    button.Parent = card
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 7)
-    corner.Parent = button
-    return button
-end
-
-local reRecordButton = makeActionButton(
-    "MacroReRecordButton",
-    UDim2.new(1, -184, 0, 91),
-    "RE-RECORD",
-    Color3.fromRGB(57, 43, 30),
-    Color3.fromRGB(160, 140, 110)
-)
-local deleteButton = makeActionButton(
-    "MacroDeleteSelectedButton",
-    UDim2.new(1, -96, 0, 91),
-    "DELETE",
-    Color3.fromRGB(48, 34, 42),
-    Color3.fromRGB(150, 115, 125)
-)
-
-local pendingDeleteName = nil
-local pendingDeleteAt = nil
-
-local function updateActionButtons()
-    if not reRecordButton.Parent or not deleteButton.Parent then return end
-
-    if STATE.MacroOverwriteArmed then
-        reRecordButton.Text = "CANCEL"
-        reRecordButton.BackgroundColor3 = Color3.fromRGB(75, 35, 48)
-        reRecordButton.TextColor3 = Color3.fromRGB(255, 135, 155)
-        reRecordButton.Active = true
-        reRecordButton.AutoButtonColor = true
-        deleteButton.Active = false
-        deleteButton.AutoButtonColor = false
-        deleteButton.BackgroundColor3 = Color3.fromRGB(40, 31, 37)
-        deleteButton.TextColor3 = Color3.fromRGB(115, 95, 105)
-        deleteButton.Text = "DELETE"
-        return
-    end
-
-    local selected = getSelectedSavedMacro()
-    if selected then
-        reRecordButton.Text = "RE-RECORD"
-        reRecordButton.BackgroundColor3 = Color3.fromRGB(83, 53, 30)
-        reRecordButton.TextColor3 = Color3.fromRGB(255, 210, 128)
-        reRecordButton.Active = true
-        reRecordButton.AutoButtonColor = true
-
-        deleteButton.Text = (pendingDeleteName == selected) and "CONFIRM?" or "DELETE"
-        deleteButton.BackgroundColor3 = (pendingDeleteName == selected)
-            and Color3.fromRGB(100, 30, 48) or Color3.fromRGB(75, 30, 48)
-        deleteButton.TextColor3 = Color3.fromRGB(255, 125, 150)
-        deleteButton.Active = true
-        deleteButton.AutoButtonColor = true
-    else
-        -- Keep both controls visually obvious even before a macro is selected.
-        -- The handlers explain the required selection instead of hiding the buttons.
-        reRecordButton.Text = "RE-RECORD"
-        reRecordButton.BackgroundColor3 = Color3.fromRGB(83, 53, 30)
-        reRecordButton.TextColor3 = Color3.fromRGB(255, 210, 128)
-        reRecordButton.Active = not isBusy()
-        reRecordButton.AutoButtonColor = not isBusy()
-
-        deleteButton.Text = (pendingDeleteName ~= nil) and "CONFIRM?" or "DELETE"
-        deleteButton.BackgroundColor3 = Color3.fromRGB(75, 30, 48)
-        deleteButton.TextColor3 = Color3.fromRGB(255, 125, 150)
-        deleteButton.Active = not isBusy()
-        deleteButton.AutoButtonColor = not isBusy()
-        if pendingDeleteName ~= nil then
-            local stillSelected = getSelectedSavedMacro()
-            if stillSelected ~= pendingDeleteName then
-                pendingDeleteName = nil
-                pendingDeleteAt = nil
-                deleteButton.Text = "DELETE"
-            end
-        end
-    end
-end
-
--- Keep buttons synchronized whenever the base code changes or refreshes selection.
-local originalRefresh = STATE.RefreshMacroSlotSelector
-STATE.RefreshMacroSlotSelector = function(...)
-    local result = originalRefresh(...)
-    if not STATE.MacroIsDraft then
-        STATE.MacroOverwriteArmed = false
-        STATE.MacroOverwriteTargetName = nil
-    end
-    updateActionButtons()
-    return result
-end
-
-local function armOverwrite(name)
-    if isBusy() then
-        setStatus("Stop recording / playback before re-recording a macro", Color3.fromRGB(255, 199, 107))
-        return false
-    end
-    if STATE.MacroOverwriteArmed then
-        setStatus("A re-record is already armed • press CANCEL only after stopping the recorder", Color3.fromRGB(255, 199, 107))
-        return false
-    end
-    if STATE.MacroIsDraft and #(STATE.Placements or {}) > 0 then
-        setStatus("Save or cancel the current draft before switching macros", Color3.fromRGB(255, 199, 107))
-        return false
-    end
-    if not savedFileExists(name) then
-        setStatus("Saved macro file not found: " .. tostring(name), Color3.fromRGB(255, 83, 126))
-        return false
-    end
-
-    -- Load the exact selected JSON before enabling draft mode. This is critical:
-    -- START RECORDING will then use the same filename, and STOP & SAVE replaces it.
-    local loaded = STATE.SelectMacroFile(name)
-    if loaded ~= true then
-        setStatus("Could not load macro before re-recording: " .. tostring(name), Color3.fromRGB(255, 83, 126))
-        return false
-    end
-
-    STATE.MacroName = name
-    STATE.MacroIsDraft = true
-    STATE.MacroOverwriteArmed = true
-    STATE.MacroOverwriteTargetName = name
-    STATE.SelectedMacroSlotName = nil
-    STATE.SelectedMacroSlotIndex = nil
-    if type(STATE.RefreshMacroSlotSelector) == "function" then
-        STATE.RefreshMacroSlotSelector(name)
-    end
-    if STATE.MacroDropdownPanel then STATE.MacroDropdownPanel.Visible = false end
-    updateActionButtons()
-    setStatus(
-        "RE-RECORD READY: " .. name .. " • press START RECORDING; STOP & SAVE overwrites this file",
-        Color3.fromRGB(255, 199, 107)
-    )
-    return true
-end
-
-local function cancelOverwrite()
-    if isBusy() then
-        setStatus("Stop recording / playback before cancelling re-record", Color3.fromRGB(255, 199, 107))
-        return
-    end
-    if not STATE.MacroOverwriteArmed then return end
-
-    local target = STATE.MacroOverwriteTargetName or STATE.MacroName
-    STATE.MacroOverwriteArmed = false
-    STATE.MacroOverwriteTargetName = nil
-    STATE.MacroIsDraft = false
-    STATE.SelectedMacroSlotName = target
-    STATE.SelectedMacroSlotIndex = nil
-
-    local loaded = STATE.SelectMacroFile(target)
-    if loaded then
-        setStatus("Re-record cancelled • original saved macro restored: " .. target, Color3.fromRGB(72, 245, 153))
-    else
-        setStatus("Cancelled re-record, but could not reload saved macro: " .. target, Color3.fromRGB(255, 83, 126))
-    end
-    updateActionButtons()
-end
-
-local function deleteSavedMacro(name)
-    if isBusy() then
-        setStatus("Stop recording / playback before deleting a macro", Color3.fromRGB(255, 199, 107))
-        return false
-    end
-    if STATE.MacroOverwriteArmed then
-        setStatus("Cancel RE-RECORD mode before deleting a macro", Color3.fromRGB(255, 199, 107))
-        return false
-    end
-
-    local targetPath = macroPath(name)
-    local exists = savedFileExists(name)
-    if exists then
-        if type(delfile) ~= "function" then
-            setStatus("This executor does not expose delfile; cannot delete macro", Color3.fromRGB(255, 83, 126))
-            return false
-        end
-        local deleted, deleteError = pcall(delfile, targetPath)
-        if not deleted then
-            setStatus("Delete failed: " .. tostring(deleteError), Color3.fromRGB(255, 83, 126))
-            return false
-        end
-        if type(isfile) == "function" then
-            local checkOk, stillExists = pcall(isfile, targetPath)
-            if checkOk and stillExists then
-                setStatus("The macro file still exists after delete request", Color3.fromRGB(255, 83, 126))
-                return false
-            end
-        end
-    end
-
-    local allNames = {}
-    if type(STATE.ReadMacroSlotNames) == "function" then
-        local ok, names = pcall(STATE.ReadMacroSlotNames)
-        if ok and type(names) == "table" then allNames = names end
-    end
-    local remaining = {}
-    for _, savedName in ipairs(allNames) do
-        if macroPath(savedName) ~= targetPath then
-            remaining[#remaining + 1] = savedName
-        end
-    end
-
-    local indexOk, indexError = pcall(function()
-        if type(writefile) ~= "function" then error("writefile is unavailable") end
-        if type(STATE.EnsureMacroFolders) == "function" then STATE.EnsureMacroFolders() end
-        writefile(STATE.MacroIndexPath, HttpService:JSONEncode(remaining))
-    end)
-
-    local wasCurrent = STATE.MacroName and macroPath(STATE.MacroName) == targetPath
-    pendingDeleteName = nil
-    pendingDeleteAt = nil
-    STATE.MacroSlots = remaining
-
-    if wasCurrent then
-        STATE.MacroIsDraft = false
-        STATE.MacroOverwriteArmed = false
-        STATE.MacroOverwriteTargetName = nil
-        STATE.SelectedMacroSlotName = nil
-        STATE.SelectedMacroSlotIndex = nil
-        STATE.Placements = {}
-        if remaining[1] and type(STATE.SelectMacroFile) == "function" then
-            STATE.SelectMacroFile(remaining[1])
-        else
-            STATE.MacroName = "My GTD Strategy"
-            STATE.RefreshMacroSlotSelector(nil)
-            if countLabel then countLabel.Text = "0 actions • no saved macro selected" end
-        end
-    else
-        STATE.RefreshMacroSlotSelector(STATE.MacroName)
-    end
-
-    if STATE.MacroDropdownPanel and STATE.MacroDropdownPanel.Visible
-        and type(STATE.RenderMacroDropdown) == "function" then
-        STATE.RenderMacroDropdown()
-    end
-    updateActionButtons()
-
-    if indexOk then
-        setStatus("Deleted saved macro: " .. tostring(name), Color3.fromRGB(72, 245, 153))
-    else
-        setStatus(
-            "Macro file deleted, but index.json update failed: " .. tostring(indexError),
-            Color3.fromRGB(255, 199, 107)
-        )
-    end
-    return true
-end
-
-local reRecordConnection = reRecordButton.Activated:Connect(function()
-    if STATE.MacroOverwriteArmed then
-        cancelOverwrite()
-        return
-    end
-    local selected = getSelectedSavedMacro()
-    if not selected then
-        setStatus("Open SELECT MACRO and select a saved macro first", Color3.fromRGB(255, 199, 107))
-        return
-    end
-    armOverwrite(selected)
-end)
-
-local deleteConnection = deleteButton.Activated:Connect(function()
-    local selected = getSelectedSavedMacro()
-    if not selected then
-        setStatus("Select a saved macro before deleting", Color3.fromRGB(255, 199, 107))
-        return
-    end
-    if isBusy() then
-        setStatus("Stop recording / playback before deleting a macro", Color3.fromRGB(255, 199, 107))
-        return
-    end
-    if pendingDeleteName == selected and pendingDeleteAt and os.clock() - pendingDeleteAt <= 8 then
-        deleteSavedMacro(selected)
-    else
-        pendingDeleteName = selected
-        pendingDeleteAt = os.clock()
-        updateActionButtons()
-        setStatus("Click CONFIRM? within 8 seconds to delete: " .. selected, Color3.fromRGB(255, 125, 150))
-    end
-end)
-
-if type(HUB.Connections) == "table" then
-    table.insert(HUB.Connections, reRecordConnection)
-    table.insert(HUB.Connections, deleteConnection)
-end
-
-updateActionButtons()
-STATE.MacroToolsVersion = "2.2.37"
-STATE.MacroToolsCard = card
-setStatus("Macro tools v2.2.37 attached • open Macro Recorder to use RE-RECORD / DELETE", Color3.fromRGB(72, 245, 153))
-print("[GTD Control Hub v2.2.37] Controls created: "
-    .. tostring(card:FindFirstChild("MacroReRecordButton") ~= nil) .. " / "
-    .. tostring(card:FindFirstChild("MacroDeleteSelectedButton") ~= nil)
-    .. " • card=" .. card:GetFullName())
+print("[GTD Control Hub v2.2.37] Playback session recovery, repeat generation and macro controls loaded.")
